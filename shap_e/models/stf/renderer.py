@@ -190,47 +190,47 @@ def render_views_from_stf(
         raw_density = None
         if "density" in sdf_out:
             raw_density = sdf_out.density
-        with torch.autocast(device_type, enabled=False):
-            fields = sdf_out.signed_distance.float()
-            raw_signed_distance = sdf_out.signed_distance
-            assert (
-                len(fields.shape) == 3 and fields.shape[-1] == 1
-            ), f"expected [meta_batch x inner_batch] SDF results, but got {fields.shape}"
-            fields = fields.reshape(batch_size, *([grid_size] * 3))
 
-            # Force a negative border around the SDFs to close off all the models.
-            full_grid = torch.zeros(
-                batch_size,
-                grid_size + 2,
-                grid_size + 2,
-                grid_size + 2,
-                device=fields.device,
-                dtype=fields.dtype,
-            )
-            full_grid.fill_(-1.0)
-            full_grid[:, 1:-1, 1:-1, 1:-1] = fields
-            fields = full_grid
+        fields = sdf_out.signed_distance.float()
+        raw_signed_distance = sdf_out.signed_distance
+        assert (
+            len(fields.shape) == 3 and fields.shape[-1] == 1
+        ), f"expected [meta_batch x inner_batch] SDF results, but got {fields.shape}"
+        fields = fields.reshape(batch_size, *([grid_size] * 3))
 
-            raw_meshes = []
-            mesh_mask = []
-            for field in fields:
-                raw_mesh = marching_cubes(field, volume.bbox_min, volume.bbox_max - volume.bbox_min)
-                if len(raw_mesh.faces) == 0:
-                    # DDP deadlocks when there are unused parameters on some ranks
-                    # and not others, so we make sure the field is a dependency in
-                    # the graph regardless of empty meshes.
-                    vertex_dependency = field.mean()
-                    raw_mesh = TorchMesh(
-                        verts=torch.zeros(3, 3, device=device) + vertex_dependency,
-                        faces=torch.tensor([[0, 1, 2]], dtype=torch.long, device=device),
-                    )
-                    # Make sure we only feed back zero gradients to the field
-                    # by masking out the final renderings of this mesh.
-                    mesh_mask.append(False)
-                else:
-                    mesh_mask.append(True)
-                raw_meshes.append(raw_mesh)
-            mesh_mask = torch.tensor(mesh_mask, device=device)
+        # Force a negative border around the SDFs to close off all the models.
+        full_grid = torch.zeros(
+            batch_size,
+            grid_size + 2,
+            grid_size + 2,
+            grid_size + 2,
+            device=fields.device,
+            dtype=fields.dtype,
+        )
+        full_grid.fill_(-1.0)
+        full_grid[:, 1:-1, 1:-1, 1:-1] = fields
+        fields = full_grid
+
+        raw_meshes = []
+        mesh_mask = []
+        for field in fields:
+            raw_mesh = marching_cubes(field, volume.bbox_min, volume.bbox_max - volume.bbox_min)
+            if len(raw_mesh.faces) == 0:
+                # DDP deadlocks when there are unused parameters on some ranks
+                # and not others, so we make sure the field is a dependency in
+                # the graph regardless of empty meshes.
+                vertex_dependency = field.mean()
+                raw_mesh = TorchMesh(
+                    verts=torch.zeros(3, 3, device=device) + vertex_dependency,
+                    faces=torch.tensor([[0, 1, 2]], dtype=torch.long, device=device),
+                )
+                # Make sure we only feed back zero gradients to the field
+                # by masking out the final renderings of this mesh.
+                mesh_mask.append(False)
+            else:
+                mesh_mask.append(True)
+            raw_meshes.append(raw_mesh)
+        mesh_mask = torch.tensor(mesh_mask, device=device)
 
         max_vertices = max(len(m.verts) for m in raw_meshes)
 
@@ -257,14 +257,13 @@ def render_views_from_stf(
         tf_out.channels = _convert_srgb_to_linear(tf_out.channels)
 
     # Make sure the raw meshes have colors.
-    with torch.autocast(device_type, enabled=False):
-        textures = tf_out.channels.float()
-        assert len(textures.shape) == 3 and textures.shape[-1] == len(
-            texture_channels
-        ), f"expected [meta_batch x inner_batch x texture_channels] field results, but got {textures.shape}"
-        for m, texture in zip(raw_meshes, textures):
-            texture = texture[: len(m.verts)]
-            m.vertex_channels = {name: ch for name, ch in zip(texture_channels, texture.unbind(-1))}
+    textures = tf_out.channels.float()
+    assert len(textures.shape) == 3 and textures.shape[-1] == len(
+        texture_channels
+    ), f"expected [meta_batch x inner_batch x texture_channels] field results, but got {textures.shape}"
+    for m, texture in zip(raw_meshes, textures):
+        texture = texture[: len(m.verts)]
+        m.vertex_channels = {name: ch for name, ch in zip(texture_channels, texture.unbind(-1))}
 
     args = dict(
         options=options,
@@ -339,47 +338,47 @@ def _render_with_pytorch3d(
     device = camera.origin.device
     device_type = device.type
 
-    with torch.autocast(device_type, enabled=False):
-        meshes = convert_meshes(raw_meshes)
+    
+    meshes = convert_meshes(raw_meshes)
 
-        lights = blender_uniform_lights(
-            batch_size,
-            device,
-            ambient_color=ambient_color,
-            diffuse_color=diffuse_color,
-            specular_color=specular_color,
+    lights = blender_uniform_lights(
+        batch_size,
+        device,
+        ambient_color=ambient_color,
+        diffuse_color=diffuse_color,
+        specular_color=specular_color,
+    )
+
+    # Separate camera intrinsics for each view, so that we can
+    # create a new camera for each batch of views.
+    cam_shape = [batch_size, inner_batch_size, -1]
+    position = camera.origin.reshape(cam_shape)
+    x = camera.x.reshape(cam_shape)
+    y = camera.y.reshape(cam_shape)
+    z = camera.z.reshape(cam_shape)
+
+    results = []
+    for i in range(inner_batch_size):
+        sub_cams = convert_cameras_torch(
+            position[:, i], x[:, i], y[:, i], z[:, i], fov=camera.x_fov
         )
-
-        # Separate camera intrinsics for each view, so that we can
-        # create a new camera for each batch of views.
-        cam_shape = [batch_size, inner_batch_size, -1]
-        position = camera.origin.reshape(cam_shape)
-        x = camera.x.reshape(cam_shape)
-        y = camera.y.reshape(cam_shape)
-        z = camera.z.reshape(cam_shape)
-
-        results = []
-        for i in range(inner_batch_size):
-            sub_cams = convert_cameras_torch(
-                position[:, i], x[:, i], y[:, i], z[:, i], fov=camera.x_fov
-            )
-            imgs = render_images(
-                camera.width,
-                meshes,
-                sub_cams,
-                lights,
-                use_checkpoint=options.checkpoint_render,
-                **options.get("render_options", {}),
-            )
-            results.append(imgs)
-        views = torch.stack(results, dim=1)
-        views = views.view(batch_size, *inner_shape, camera.height, camera.width, n_channels + 1)
-
-        out = AttrDict(
-            channels=views[..., :-1],  # [batch_size, *inner_shape, height, width, n_channels]
-            transmittance=1 - views[..., -1:],  # [batch_size, *inner_shape, height, width, 1]
-            meshes=meshes,
+        imgs = render_images(
+            camera.width,
+            meshes,
+            sub_cams,
+            lights,
+            use_checkpoint=options.checkpoint_render,
+            **options.get("render_options", {}),
         )
+        results.append(imgs)
+    views = torch.stack(results, dim=1)
+    views = views.view(batch_size, *inner_shape, camera.height, camera.width, n_channels + 1)
+
+    out = AttrDict(
+        channels=views[..., :-1],  # [batch_size, *inner_shape, height, width, n_channels]
+        transmittance=1 - views[..., -1:],  # [batch_size, *inner_shape, height, width, 1]
+        meshes=meshes,
+    )
 
     return out
 
@@ -411,48 +410,48 @@ def _render_with_raycast(
     y = camera.y.reshape(cam_shape)
     z = camera.z.reshape(cam_shape)
 
-    with torch.autocast(device_type, enabled=False):
-        all_meshes = []
-        for i, mesh in enumerate(raw_meshes):
-            all_meshes.append(
-                TorchTriMesh(
-                    faces=mesh.faces.long(),
-                    vertices=mesh.verts.float(),
-                    vertex_colors=tf_out.channels[i, : len(mesh.verts)].float(),
+
+    all_meshes = []
+    for i, mesh in enumerate(raw_meshes):
+        all_meshes.append(
+            TorchTriMesh(
+                faces=mesh.faces.long(),
+                vertices=mesh.verts.float(),
+                vertex_colors=tf_out.channels[i, : len(mesh.verts)].float(),
+            )
+        )
+    all_images = []
+    for i, mesh in enumerate(all_meshes):
+        for j in range(inner_batch_size):
+            all_images.append(
+                render_diffuse_mesh(
+                    camera=ProjectiveCamera(
+                        origin=origin[i, j].detach().cpu().numpy(),
+                        x=x[i, j].detach().cpu().numpy(),
+                        y=y[i, j].detach().cpu().numpy(),
+                        z=z[i, j].detach().cpu().numpy(),
+                        width=camera.width,
+                        height=camera.height,
+                        x_fov=camera.x_fov,
+                        y_fov=camera.y_fov,
+                    ),
+                    mesh=mesh,
+                    diffuse=float(np.array(diffuse_color).mean()),
+                    ambient=float(np.array(ambient_color).mean()),
+                    ray_batch_size=16,  # low memory usage
+                    checkpoint=options.checkpoint_render,
                 )
             )
-        all_images = []
-        for i, mesh in enumerate(all_meshes):
-            for j in range(inner_batch_size):
-                all_images.append(
-                    render_diffuse_mesh(
-                        camera=ProjectiveCamera(
-                            origin=origin[i, j].detach().cpu().numpy(),
-                            x=x[i, j].detach().cpu().numpy(),
-                            y=y[i, j].detach().cpu().numpy(),
-                            z=z[i, j].detach().cpu().numpy(),
-                            width=camera.width,
-                            height=camera.height,
-                            x_fov=camera.x_fov,
-                            y_fov=camera.y_fov,
-                        ),
-                        mesh=mesh,
-                        diffuse=float(np.array(diffuse_color).mean()),
-                        ambient=float(np.array(ambient_color).mean()),
-                        ray_batch_size=16,  # low memory usage
-                        checkpoint=options.checkpoint_render,
-                    )
-                )
 
-        n_channels = len(texture_channels)
-        views = torch.stack(all_images).view(
-            batch_size, *inner_shape, camera.height, camera.width, n_channels + 1
-        )
-        return AttrDict(
-            channels=views[..., :-1],  # [batch_size, *inner_shape, height, width, n_channels]
-            transmittance=1 - views[..., -1:],  # [batch_size, *inner_shape, height, width, 1]
-            meshes=all_meshes,
-        )
+    n_channels = len(texture_channels)
+    views = torch.stack(all_images).view(
+        batch_size, *inner_shape, camera.height, camera.width, n_channels + 1
+    )
+    return AttrDict(
+        channels=views[..., :-1],  # [batch_size, *inner_shape, height, width, n_channels]
+        transmittance=1 - views[..., -1:],  # [batch_size, *inner_shape, height, width, 1]
+        meshes=all_meshes,
+    )
 
 
 def _convert_srgb_to_linear(u: torch.Tensor) -> torch.Tensor:
